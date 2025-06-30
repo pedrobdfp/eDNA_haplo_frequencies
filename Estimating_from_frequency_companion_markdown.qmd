@@ -1,0 +1,1089 @@
+---
+title: "Estimating_N_from_haplotype_frequency"
+format: html
+editor:   
+  name: Pedro Brandao
+  chunk_output_type: console
+---
+
+```{r}
+suppressMessages(library(tidyverse))
+suppressMessages(library(stats))
+suppressMessages(library(utils))
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggpmisc))
+suppressMessages(library(cowplot))
+suppressMessages(library(dplyr))
+```
+
+##Estimating number of contributors based on haplotype frequency
+
+##Maximum likelihood normal aproximation
+
+Given panmixia, the vector of counts of haplotype identities of a group of individuals j in a population is given by a multinomial draw:
+
+n_j = (n_ij,…n_kj) ~ Multinomial (N_j, π),
+
+where π = (p_i,…,p_K) is the population frequency vector of haplotypes i ∈ {1,…,k}, and N_j is the total (unknown) number of contributors.
+
+Thus, u_ij is the frequency of contributors with haplotype i in group j:
+
+u_ij = n_ij / N_j
+
+If we consider this group of individuals as contributors to an eDNA sample, the number of molecules they shed—and their observed frequencies, f_i—will reflect their haplotype frequencies:
+
+E[f_ij] = u_ij
+
+These frequencies carry information that can be used to estimate N_j.
+
+The probability density function (PDF) of the multinomial distribution is defined for a fixed N (the number of draws). Therefore, to estimate N, we assume f_i is approximately normally distributed according to the Central Limit Theorem. Its mean is the population frequency (p_i), and its variance comes from the multinomial process:
+
+f_i ~ Normal(p_i, (p_i * (1 - p_i)) / N)
+
+In this case, the probability density function of f_i is:
+
+P(f_i | N, p_i) = 1 / (sigma * sqrt(2 * pi)) * exp(-(f_i - p_i)^2 / (2 * sigma^2))
+
+So the log-likelihood becomes:
+
+LnL(N) = Sum(-1/2 * log(2 * pi * sigma^2) - (f_i - p_i)^2 / (2 * sigma^2))
+
+If you work through this equation, take the derivative of the negative log-likelihood, and solve for N, you eventually find:
+
+N_MLE = k / Sum((f_i - p_i)^2 / (p_i * (1 - p_i)))
+
+where k is the number of haplotypes.
+
+Below is a function that applied that
+
+##Function that calculates N by maximum likelihood
+##new
+
+```{r}
+estimate_N_MLE <- function(
+    pi,
+    f_mat,            # either a 1×k vector or an R×k matrix of raw read-counts
+    lower_N    = 1,
+    upper_N    = 1e4,
+    conf_level = 0.95,
+    plot       = TRUE,
+    ploidy     = c("none","haploid","diploid")
+) {
+  ## 1. validate & prep
+  ploidy <- match.arg(tolower(ploidy), c("none","haploid","diploid"))
+  pi     <- as.numeric(pi)
+  pi     <- pi / sum(pi)
+  k      <- length(pi)
+  if (is.vector(f_mat)) f_mat <- matrix(f_mat, nrow = 1)
+  if (!is.matrix(f_mat)) stop("'f_mat' must be a vector or matrix.")
+  if (ncol(f_mat) != k) stop("ncol(f_mat) must equal length(pi).")
+  
+  ## 2. convert to per-replicate frequencies
+  rep_tot <- rowSums(f_mat, na.rm = TRUE)
+  freq_mat <- sweep(f_mat, 1, rep_tot, "/")
+  freq_mat[is.na(freq_mat)] <- 1/k
+  R <- nrow(freq_mat)
+  
+  ## 3. enforce ploidy floor
+  k_obs <- sum(colSums(freq_mat) > 0)
+  min_contrib <- switch(ploidy,
+                        "haploid" = k_obs,
+                        "diploid" = ceiling(k_obs/2),
+                        "none"    = 0)
+  
+  ## 4. replicate-wise deviation & pooled S_bar
+  S_r   <- apply(freq_mat, 1, function(fr) sum((fr - pi)^2 / (pi * (1 - pi))))
+  S_bar <- mean(S_r)
+  
+  ## 5. closed-form MLE
+  N_raw <- if (S_bar == 0) Inf else (R * k) / sum(S_r)
+  N_hat <- max(N_raw, min_contrib, lower_N)
+  
+  ## 6. profile-likelihood CI with adjusted scaling
+  R_eff <- 1 #error does nto scale with reps since theya re not fully independent
+  loglik_CI <- function(N) {
+    if (N <= 0) return(-Inf)
+    R_eff * (k/2 * log(N) - (N/2) * S_bar) -
+      0.5 * R_eff * sum(log(2 * pi * (1 - pi)))
+  }
+  L_max  <- loglik_CI(N_hat)
+  cut    <- L_max - 0.5 * qchisq(conf_level, df = 1)
+  lower_ci <- tryCatch(
+    uniroot(function(x) loglik_CI(x) - cut,
+            c(min_contrib, N_hat))$root,
+    error = function(e) min_contrib
+  )
+  upper_ci <- tryCatch(
+    uniroot(function(x) loglik_CI(x) - cut,
+            c(N_hat, upper_N))$root,
+    error = function(e) upper_N
+  )
+  lower_ci <- max(lower_ci, min_contrib, lower_N)
+  upper_ci <- min(upper_ci, upper_N)
+  
+  ## 7. optional plot
+  if (plot) {
+    Ns <- seq(lower_N, upper_N, length.out = 400)
+    plot(Ns, sapply(Ns, loglik_CI), type = "l",
+         xlab = "N", ylab = "Log-likelihood")
+    abline(v = N_hat, col = "red",  lty = 2)
+    abline(h = cut,   col = "blue", lty = 3)
+  }
+  
+  list(N_MLE         = round(N_hat),
+       conf_interval = c(lower_ci, upper_ci))
+}
+
+```
+
+Let's make an exercise to understand the inputs and outputs of this function.  
+We start with a sample where we only observed the most frequent haplotype:
+
+```{r}
+# Define the true population haplotype frequencies (p_i)
+p_i <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06, 0.05,  0.03, 0.03, 0.01, 0.01,  0.005) 
+# Define the observed haplotype frequencies in the eDNA sample (f_i)
+f_i <- c(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+estimate_N_MLE(p_i, f_i, upper_N = 100, conf_level = 0.95, plot = TRUE)
+```
+
+In the case above, the most likely number of contributors is 4. Additionally, we have a confidence interval of 95% between 1.7 and 8.2.
+
+You can also feed it read counts instead of frequencies:
+
+```{r}
+# Define the true population haplotype frequencies (p_i)
+p_i <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06, 0.05,  0.03, 0.03, 0.01, 0.01,  0.005) 
+# Define the observed haplotype frequencies in the eDNA sample (f_i)
+f_i <- c(827, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+estimate_N_MLE(p_i, f_i, upper_N = 100, conf_level = 0.95, plot = TRUE)
+```
+
+We may also provide multiple replicates:
+
+```{r}
+p_i <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06, 0.05,  0.03, 0.03, 0.01, 0.01,  0.005) 
+#Three observations where we only observe the most frequent allele, but the first is blank
+f_mat <- matrix(
+  c(
+    # Replicate 1 frequencies:
+    827, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ,0.0 ,0.0, 0.0, 0.0,
+    # Replicate 2 frequencies:
+    567, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ,0.0 ,0.0, 0.0, 0.0,
+    # Replicate 3 frequencies:
+    1400, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ,0.0 ,0.0, 0.0, 0.0
+  ),
+  nrow = 3, 
+  ncol = 13, 
+  byrow = TRUE
+)
+
+# Estimate N and its 95% confidence interval
+estimate_N_MLE(p_i, f_mat, upper_N = 100, conf_level = 0.95, plot = TRUE)
+```
+
+Let's try again with a different sample where we only observed reads for a rare allele
+
+```{r}
+f_i <- c(0, 0, 0, 0, 0, 0, 0, 3452, 0, 0, 0, 0, 0)
+
+estimate_N_MLE(p_i, f_i, upper_N = 100, conf_level = 0.95, plot = TRUE)
+```
+
+In this case, the maximum likelihood is so small it approximates 1! This is because it is almost impossible we obtain only the very rare allele and nothing else.
+
+Finally, we try with the same sample where the observed frequencies are close to the real frequencies
+
+```{r}
+f_i <- c(0.33, 0.22, 0.12, 0.15, 0.0, 0.1, 0.0, 0.05, 0.03, 0.0, 0.0, 0.0,  0.0)
+estimate_N_MLE(p_i, f_i, upper_N = 500, conf_level = 0.95, plot = TRUE)
+```
+
+Now the maximum likelihood suggested 43, which is a (seemly) arbitrarily high value. Also note how wide the confidence interval is, between 17.7 and 84.5.
+
+##Aplying maximum likelihood functions to simulated data
+
+Now that we understand the link function and how it interprets data, we can apply it to the simulated data and see how well these mathematical notations can predict the number of contributors we had in the sample.
+
+## Generating the contributors to the eDNA sample
+
+Environmental DNA data is unique in that it is a mix of varying proportions of multiple contributors. How much DNA each individual contributes to an eDNA sample depends on several factors such as their size, and distance from sampling location. Therefore, to model the variability intrinsic to eDNA data, first we have to generate a set of contributors that vary in these crucial aspects
+
+We will also assign each contributor a haplotype/ allele given a known haplotype/ allele frequency.
+
+```{r}
+generate_contributors <- function(
+    n_samples,
+    n_contributors_range,
+    behavior = c("Grouped", "Ungrouped"),
+    haplotype_freqs,
+    size_range = c(1, 10),
+    distance_range = c(0, 100),
+    group_size_range = NULL,
+    n_distribution = c("Random", "Negative Binomial")
+) {
+  # Input validation
+  if (length(n_contributors_range) != 2 || n_contributors_range[1] > n_contributors_range[2]) {
+    stop("'n_contributors_range' must be a numeric vector of length 2 with increasing values.")
+  }
+  if (any(haplotype_freqs < 0) || sum(haplotype_freqs) <= 0) {
+    stop("'haplotype_freqs' must contain non-negative values and sum to a positive number.")
+  }
+  # Normalize haplotype frequencies
+  haplotype_freqs <- haplotype_freqs / sum(haplotype_freqs)
+  
+  behavior <- match.arg(behavior)
+  n_distribution <- match.arg(n_distribution)
+  
+  if (length(size_range) != 2 || size_range[1] > size_range[2]) {
+    stop("'size_range' must be a numeric vector of length 2 with increasing values.")
+  }
+  if (length(distance_range) != 2 || distance_range[1] > distance_range[2]) {
+    stop("'distance_range' must be a numeric vector of length 2 with increasing values.")
+  }
+  if (behavior == "Grouped" && (is.null(group_size_range) || length(group_size_range) != 2 || group_size_range[1] > group_size_range[2])) {
+    stop("For 'Grouped' behavior, 'group_size_range' must be provided as a numeric vector of length 2 with increasing values.")
+  }
+  
+  # Preallocate list to hold dataframes for each sample
+  sample_list <- vector("list", n_samples)
+  
+  # Determine mu from the upper limit of n_contributors_range
+  mu_val <- n_contributors_range[2] / 5
+  
+  for (sample_num in seq_len(n_samples)) {
+    # Determine number of contributors based on chosen distribution
+    if (n_distribution == "Random") {
+      n_contributors <- sample(n_contributors_range[1]:n_contributors_range[2], 1)
+    } else if (n_distribution == "Negative Binomial") {
+      # Draw from negative binomial until a value in the specified range is obtained
+      repeat {
+        n_contributors_candidate <- rnbinom(1, size = 1, mu = mu_val)
+        if (n_contributors_candidate >= n_contributors_range[1] && n_contributors_candidate <= n_contributors_range[2]) {
+          n_contributors <- n_contributors_candidate
+          break
+        }
+      }
+    }
+    # Assign haplotypes to contributors
+    haplotypes <- sample(
+      x = seq_along(haplotype_freqs),
+      size = n_contributors,
+      replace = TRUE,
+      prob = haplotype_freqs
+    )
+    # Assign distances based on behavior
+    if (behavior == "Grouped") {
+      group_sizes <- c()
+      remaining_contributors <- n_contributors
+      # Loop to assign group sizes
+      while (remaining_contributors > 0) {
+        # Adjust group size range based on remaining contributors
+        max_group_size <- min(group_size_range[2], remaining_contributors)
+        min_group_size <- min(group_size_range[1], remaining_contributors)
+        # Sample a group size
+        group_size <- sample(min_group_size:max_group_size, 1)
+        group_sizes <- c(group_sizes, group_size)
+        # Update remaining contributors
+        remaining_contributors <- remaining_contributors - group_size
+      }
+      n_groups <- length(group_sizes)
+      # Assign distances to each group
+      group_distances <- runif(n_groups, distance_range[1], distance_range[2])
+      # Assign contributors to groups and distances
+      distances <- unlist(mapply(function(size, dist) {
+        rep(dist, size)
+      }, group_sizes, group_distances))
+      
+    } else if (behavior == "Ungrouped") {
+      # Contributors have individual distances
+      distances <- runif(n_contributors, distance_range[1], distance_range[2])
+    }
+    
+    # Assign sizes to contributors
+    sizes <- runif(n_contributors, size_range[1], size_range[2])
+    
+    # Create dataframe for this sample
+    sample_df <- data.frame(
+      SampleID = sample_num,
+      ContributorID = seq_len(n_contributors),
+      Haplotype = haplotypes,
+      Distance = distances,
+      Size = sizes
+    )
+
+    # Add to list
+    sample_list[[sample_num]] <- sample_df
+  }
+
+  return(sample_list)
+}
+```
+
+##Example use
+
+Here is an example use of the function, where we generate a set of contributors to eDNA samples. These are randomly distributed around the sample, have a range of sizes, and are randomly assigned a haplotype from a known frequency.
+
+```{r}
+# Define input parameters
+n_samples <- 200
+n_contributors_range <- c(1, 200)
+haplotype_freqs <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06, 0.05,  0.03, 0.03, 0.01, 0.01,  0.005) #hyper variable locus
+f_i <- haplotype_freqs
+#haplotype_freqs <- c(0.854, 0.132, 0.0035, 0.0035, 0.0025, 0.0015, 0.0015, 0.0015)
+sum(haplotype_freqs) #check if frequencies sum to 1
+size_range <- c(1, 10)
+distance_range <- c(0, 100)
+
+ungrouped_contributors_list <- generate_contributors(
+  n_samples = n_samples,
+  n_contributors_range = n_contributors_range,
+  behavior = "Ungrouped",
+  haplotype_freqs = haplotype_freqs,
+  size_range = size_range,
+  distance_range = distance_range,
+  n_distribution = "Random"
+)
+str(ungrouped_contributors_list[1:2])
+```
+
+Or even we can create it with a negative binomial distribution of abundances instead of randomly distributed. This is what we will use downstream
+
+```{r}
+# Define input parameters
+n_samples <- 200
+n_contributors_range <- c(1,500)
+haplotype_freqs <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06,  0.05, 0.03, 0.03, 0.01, 0.01, 0.005) #hyper variable locus
+#haplotype_freqs <- c(0.854, 0.132, 0.0035, 0.0035, 0.0025, 0.0015, 0.0015, 0.0015)
+sum(haplotype_freqs) #check if frequencies sum to 1
+size_range <- c(1, 10)
+distance_range <- c(0, 100)
+
+ungrouped_contributors_list <- generate_contributors(
+  n_samples = n_samples,
+  n_contributors_range = n_contributors_range,
+  behavior = "Ungrouped",
+  haplotype_freqs = haplotype_freqs,
+  size_range = size_range,
+  distance_range = distance_range,
+  n_distribution = "Negative Binomial"
+)
+str(ungrouped_contributors_list[1:2])
+```
+
+## Generating the eDNA from contributors
+
+Now that we have the set of contributors to an eDNA sample, we can generate the eDNA data using a second function. This function first "shed" eDNA from each individual contributor considering a shedding rate as a function of the contributor size, and with an error. Then, it will consider the decay of that eDNA as a function of the distance between contributor and eDNA sample, considering a simple exponential decay. The decayed eDNA from each contributor is then added to the total pool of eDNA in the sample.
+
+
+```{r}
+generate_eDNA <- function(
+    contributors_list,
+    shedding_error = 0,
+    decay_rate = 0.1,
+    shedding_rate = 1,
+    beta = 0.75,            # allometric scaling exponent
+    bio_reps = 1,           # number of "bottle" replicates
+    bottle_volume = 0.1,    # fraction of local pool to sample for each replicate
+    nb_size = 1                # NB 'size' if using negative binomial
+) {
+  
+  # Preallocate lists to store results
+  summary_list <- list()
+  haplotype_list <- list()
+  
+  # Loop over each sample's contributor dataframe
+  for (i in seq_along(contributors_list)) {
+    sample_df <- contributors_list[[i]]
+    sample_id <- unique(sample_df$SampleID)
+    n_contributors <- nrow(sample_df)
+    
+    # 1) Compute expected shedding for each contributor
+    # mu_i = shedding_rate * size^beta * exp(-decay_rate * distance) * multiplicative error
+    base_shedding <- shedding_rate * sample_df$Size^beta
+    # Introduce lognormal error
+    multiplicative_errors <- rlnorm(n_contributors, meanlog = 0, sdlog = shedding_error)
+    
+    # Final eDNA for each contributor i
+    eDNA_counts <- round(base_shedding * multiplicative_errors * exp(-decay_rate * sample_df$Distance))
+    
+    # Build a local pool so we do not lose track of actual N after subsampling
+    # rows = molecules, storing (ContributorID, Haplotype)
+    local_pool <- data.frame(
+      ContributorID = integer(0),
+      Haplotype = integer(0)
+    )
+    
+    for (j in seq_len(n_contributors)) {
+      cID <- sample_df$ContributorID[j]
+      hap <- sample_df$Haplotype[j]
+      count_ij <- eDNA_counts[j]
+      if (count_ij > 0) {
+        # replicate row "count_ij" times
+        local_chunk <- data.frame(
+          ContributorID = rep(cID, count_ij),
+          Haplotype = rep(hap, count_ij)
+        )
+        local_pool <- rbind(local_pool, local_chunk)
+      }
+    }
+    
+    # The total integer eDNA = total molecules in local pool
+    total_eDNA <- nrow(local_pool)
+    
+    # 3) For each bio replicate, sub-sample from local_pool
+    for (r in seq_len(bio_reps)) {
+      
+      # Build sub_pool
+      if (total_eDNA == 0) {
+        # local pool is empty => no molecules
+        replicate_size <- 0
+        sub_pool <- data.frame(ContributorID = integer(0), Haplotype = integer(0))
+      } else {
+        replicate_size <- floor(total_eDNA * bottle_volume)
+        replicate_size <- max(0, replicate_size)  # ensure non-negative
+        
+        if (replicate_size == 0) {
+          sub_pool <- data.frame(ContributorID = integer(0), Haplotype = integer(0))
+        } else {
+          selected_idx <- sample.int(total_eDNA, size = replicate_size, replace = TRUE)
+          sub_pool <- local_pool[selected_idx, ]
+        }
+      }
+      
+      # The effective eDNA in this replicate is # of molecules
+      replicate_eDNA <- nrow(sub_pool)
+      
+      # Identify which contributors are in sub_pool
+      unique_contributors <- unique(sub_pool$ContributorID)
+      n_contrib_replicate <- length(unique_contributors)
+      
+      # Summaries for distances among these sub-pool contributors
+      if (n_contrib_replicate > 0) {
+        dist_subset <- sample_df$Distance[sample_df$ContributorID %in% unique_contributors]
+        avg_distance <- mean(dist_subset)
+        closest_distance <- min(dist_subset)
+        sd_distance <- sd(dist_subset)
+      } else {
+        avg_distance <- NA
+        closest_distance <- NA
+        sd_distance <- NA
+      }
+      
+      # Summaries for haplotypes
+      if (replicate_eDNA == 0) {
+        # No molecules => 0 haplotypes
+        replicate_hapfreqs <- numeric(0)
+        replicate_hapnames <- character(0)
+        n_hap_replicate <- 0
+      } else {
+        hap_table <- table(sub_pool$Haplotype)
+        replicate_hapfreqs <- hap_table / sum(hap_table)
+        replicate_hapnames <- names(hap_table)
+        n_hap_replicate <- length(hap_table)
+      }
+      
+      # Prepare a row for Summary
+      summary_row <- data.frame(
+        SampleID = sample_id,
+        BioRep = r,
+        Total_eDNA = replicate_eDNA,
+        Total_contributors = n_contrib_replicate,
+        Number_of_haplotypes = as.factor(n_hap_replicate),
+        Avg_distance = avg_distance,
+        Closest_contributor = closest_distance,
+        SD_distance = sd_distance
+      )
+      
+      # Prepare rows for Haplotype_frequencies
+      if (length(replicate_hapfreqs) > 0) {
+        # length(replicate_hapfreqs) > 0 => normal data frame, repeated columns
+        hap_df <- data.frame(
+          SampleID = rep(sample_id, length(replicate_hapfreqs)),
+          BioRep = rep(r, length(replicate_hapfreqs)),
+          Haplotype = replicate_hapnames,
+          Relative_frequency = as.numeric(replicate_hapfreqs)
+        )
+      } else {
+        # 0-row data frame, ensuring same columns, length=0
+        hap_df <- data.frame(
+          SampleID = integer(0),
+          BioRep = integer(0),
+          Haplotype = character(0),
+          Relative_frequency = numeric(0)
+        )
+      }
+      
+      summary_list[[length(summary_list) + 1]] <- summary_row
+      haplotype_list[[length(haplotype_list) + 1]] <- hap_df
+    }
+  }
+  
+  # 4) Combine all replicate summaries
+  summary_df <- do.call(rbind, summary_list)
+  haplotype_df <- do.call(rbind, haplotype_list)
+  
+  # Return final result
+  return(list(Summary = summary_df, Haplotype_frequencies = haplotype_df))
+}
+
+```
+
+## Example use
+
+Here is an example use with the ungrouped data generated above. Note that the output contains two data frames. One has the Total_eDNA, the other has the haplotype frequencies
+This can take a while to run if too many samples re simulaed.
+
+```{r}
+# Define input parameters
+
+ungrouped_eDNA_results <- generate_eDNA(
+  contributors_list = ungrouped_contributors_list,
+  decay_rate = 0.05,
+  shedding_rate = 100,
+  beta = 0.75, # allometric scaling parameter
+  bio_reps = 3,          # 3 bottle replicates
+  bottle_volume = 1,
+)
+
+str(ungrouped_eDNA_results)
+```
+
+## Plotting the data we generated
+
+We can look at the data we have generated.
+
+```{r}
+# Convert Number_of_haplotypes to a properly ordered factor
+ungrouped_eDNA_results$Summary <- ungrouped_eDNA_results$Summary %>%
+  mutate(Number_of_haplotypes = as.numeric(as.character(Number_of_haplotypes))) %>%
+  arrange(Number_of_haplotypes) %>% # Arrange to double-check order
+  mutate(Number_of_haplotypes = factor(Number_of_haplotypes, 
+                                       levels = unique(Number_of_haplotypes)))
+
+# Plot
+Haplo_by_simulations <- ggplot(data = ungrouped_eDNA_results$Summary) +
+  geom_point(aes(y = Total_eDNA, 
+                 x = Total_contributors, 
+                 colour = Number_of_haplotypes)) +
+  labs(title = "Number of haplotypes in each simulated sample by number of contributors",
+       x = "Number of contributors",
+       y = "Total simulated eDNA",
+       colour = "Number of Haplotypes") +
+  scale_x_log10()+
+  scale_y_log10()+
+  theme_classic()+
+  theme(
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+  )+
+  guides(colour=guide_legend(ncol=2))
+Haplo_by_simulations
+```
+
+Note that low number of haplotypes are restricted to the bottom left part of the graph (low N), whereas high number of haplotypes are restricted to the top right (high N)
+
+## Metabarcoding
+
+Several other analyses can be made with the data in this state. But let's finish the eDNA data simulation by transforming this data into metabarcoding. To do this, a third function will randomly generate read depth for a sample around a specified value. Them, to introduce the sampling error associated with sequencing, we will take the haplotype frequency of each sample, and generate the metabarcoding sample my making a multinomial draw of this frequency to populate all the reads.
+
+```{r}
+
+simulate_metabarcoding_data <- function(
+    eDNA_data, 
+    mean_read_depth = 10000, 
+    read_depth_sd   = 0.2, 
+    error_sd        = 0.1, 
+    rep             = 1
+) {
+  # Extract the summary and haplotype data frames
+  summary_df   <- eDNA_data$Summary
+  haplotype_df <- eDNA_data$Haplotype_frequencies
+  
+  # If there is no 'BioRep' column, create one set to 1 for single-level fallback
+  if (!("BioRep" %in% colnames(summary_df))) {
+    summary_df$BioRep <- 1
+  }
+  if (!("BioRep" %in% colnames(haplotype_df))) {
+    haplotype_df$BioRep <- 1
+  }
+  
+  # Identify unique (SampleID, BioRep) pairs
+  sample_biorep_pairs <- unique(summary_df[, c("SampleID", "BioRep")])
+  
+  metabarcoding_results <- list()
+  
+  # Loop over each (SampleID, BioRep)
+  for (i in seq_len(nrow(sample_biorep_pairs))) {
+    sample_id <- sample_biorep_pairs$SampleID[i]
+    bio_rep   <- sample_biorep_pairs$BioRep[i]
+    
+    # Subset the haplotype frequencies for this sample/rep
+    sample_haplotypes <- haplotype_df[
+      haplotype_df$SampleID == sample_id &
+        haplotype_df$BioRep    == bio_rep, 
+    ]
+    
+    if (nrow(sample_haplotypes) == 0) next
+    
+    theta_o <- sample_haplotypes$Relative_frequency
+    
+    # sequencing replicates
+    for (seq_r in seq_len(rep)) {
+      
+      # 1) draw total read depth
+      R <- rlnorm(1, meanlog = log(mean_read_depth), sdlog = read_depth_sd)
+      R <- round(R)
+      
+      # 2) **symmetric additive error** with resampling of negatives
+      theta <- numeric(length(theta_o))
+      for (j in seq_along(theta_o)) {
+        repeat {
+          perturbed <- theta_o[j] + rnorm(1, mean = 0, sd = error_sd)
+          if (perturbed >= 0) {
+            theta[j] <- perturbed
+            break
+          }
+          # otherwise redraw
+        }
+      }
+      
+      # 3) normalize (or uniform if everything collapsed)
+      if (sum(theta) > 0) {
+        theta <- theta / sum(theta)
+      } else {
+        theta <- rep(1 / length(theta), length(theta))
+      }
+      
+      # 4) multinomial draw
+      if (R <= 0) {
+        counts <- rep(0, length(theta))
+      } else {
+        counts <- as.vector(rmultinom(1, size = R, prob = theta))
+      }
+      
+      # 5) stash results
+      replicate_df <- data.frame(
+        SampleID  = sample_id,
+        BioRep    = bio_rep,
+        SeqRep    = seq_r,
+        Haplotype = sample_haplotypes$Haplotype,
+        Counts    = counts
+      )
+      metabarcoding_results[[length(metabarcoding_results) + 1]] <- replicate_df
+    }
+  }
+  
+  metabarcoding_df <- do.call(rbind, metabarcoding_results)
+  return(metabarcoding_df)
+}
+
+```
+
+## Example use 
+
+Here is an example use again with the ungrouped data generated above.
+
+```{r}
+ungrouped_metabarcoding_data <- simulate_metabarcoding_data(
+  ungrouped_eDNA_results,
+  mean_read_depth = 5000,
+  read_depth_sd = 0.1,
+  error_sd = 2,
+  rep= 1
+)
+
+# View the simulated metabarcoding data
+str(ungrouped_metabarcoding_data)
+```
+
+## Visualization
+The core idea behind the method developed here is that the variability in eDNA frequency varies as a function of how many contributors there were to a sample, and also that this number of contributors, and not sampling effort, that govern the relationship between observed and population haplotype frequencies. This is because less contributors will result in higher stochasticity in sampling of alleles. Let's check if this seems to be the case in the data
+
+```{r}
+# 'ungrouped_metabarcoding_data' has all haplotypes. We'll use Replicate == 1
+global_fracs <- ungrouped_metabarcoding_data %>%
+  filter(SeqRep == 1) %>%
+  filter(BioRep == 1) %>%
+  group_by(Haplotype) %>%
+  summarise(SumCounts = sum(Counts), .groups = "drop") %>%
+  mutate(GlobalFrac = SumCounts / sum(SumCounts)) %>%
+  # Keep only haplotypes 1, 3, 13
+  filter(Haplotype %in% c(1, 3, 13)) %>%
+  # Convert numeric haplotype codes to the same factor labels used in the plot
+  mutate(Haplotype = factor(Haplotype, 
+                            levels = c(1, 3, 13), 
+                            labels = c("Haplotype 1", 
+                                       "Haplotype 3", 
+                                       "Haplotype 13")))
+#First compute total counts for *all* haplotypes in replicate 1
+total_counts <- ungrouped_metabarcoding_data %>%
+  filter(SeqRep == 1) %>%
+  filter(BioRep == 1) %>%
+  group_by(SampleID) %>%
+  summarise(Total_Counts = sum(Counts), .groups = "drop")
+
+#Now subset to the haplotypes of interest but *keep* the all-haplotype total
+Hap_freq_meta_all <- ungrouped_metabarcoding_data %>%
+  filter(SeqRep == 1, BioRep == 1, Haplotype %in% c(1, 3, 13)) %>%
+  left_join(total_counts, by = "SampleID") %>%
+  mutate(Relative_frequency = Counts / Total_Counts) %>%
+  mutate(Haplotype = factor(Haplotype, 
+                            levels = c(1, 3, 13), 
+                            labels = c("Haplotype 1", 
+                                       "Haplotype 3", 
+                                       "Haplotype 13")))
+
+#Join with eDNA summary to get 'Total_contributors', remove any NAs
+Hap_freq_meta_all <- ungrouped_eDNA_results$Summary %>%
+  filter(BioRep == 1) %>%
+  select(SampleID, Total_contributors) %>%
+  left_join(Hap_freq_meta_all, by = "SampleID") %>%
+  na.omit()
+
+# Define a custom 3-color vector that is color blind friendly
+okabe_ito_3 <- c("#E69F00", "#56B4E9", "#009E73")
+
+Haplo_frequency_plot <- ggplot(data = Hap_freq_meta_all,
+                               aes(x = Total_contributors, y = Relative_frequency, colour = Haplotype)) +
+  geom_point() +
+  geom_hline(data = global_fracs,
+             aes(yintercept = GlobalFrac), 
+             color = "black",   
+             linetype = "dashed",
+             linewidth =1)+
+  
+  facet_wrap(~ Haplotype) + 
+  labs(
+    title = "Relative frequency of three haplotypes of varying frequency within simulations",
+    x = "Number of contributors",
+    y = "Relative Frequency"
+  ) +
+  theme_classic() +
+  scale_color_manual(values = okabe_ito_3) +
+  
+  theme(
+    axis.line = element_line(size = 1),
+    axis.ticks = element_line(size = 1),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.position = "none"
+  )
+
+Haplo_frequency_plot
+
+```
+
+Note the pattern where haplotypes converge to their population frequencies
+
+## Now let's finally apply the  estimatios to simulated data!
+
+Now we have data where we know the true number of contributors (even if it is simulated data), so we can test if the math of estimating number of contributors to an eDNA sample based on haplotype frequency makes any sense. Let's start with simulated data that does not have any source of variability of error so we can get an upper estimate of the methods's predictive power given these haplotype frequencies
+
+## Simulate data with no error
+
+```{r}
+# Define input parameters without error
+set.seed(1)
+n_samples <- 200
+n_contributors_range <- c(1, 500)
+#haplotype_freqs <- c(0.854, 0.132, 0.0035, 0.0035, 0.0025, 0.0015, 0.0015, 0.0015) #hake frequencies
+haplotype_freqs <- c(0.3, 0.175, 0.1, 0.085, 0.08, 0.065, 0.06, 0.05,  0.03, 0.03, 0.01, 0.01,  0.005) #hyper variable locus
+sum(haplotype_freqs)
+size_range <- c(1,1.01) #All organisms are roughly the same size
+distance_range <- c(9.9,10) #Distance is roughly equal
+shedding_error <- 0  #No shedding error
+decay_rate <- 0.0 #No decay, because it  will cause contributors to " drop out" 
+shedding_rate <- 1
+mean_read_depth <- 100000 #very large read count that makes the error caused by sequencing smaller
+read_depth_sd <- 0  #read depth is the exact same in all samples
+error_sd = 0 #error in estimation is the same also for all samples
+p_i <- haplotype_freqs
+haplotype_names <- as.character(1:length(p_i))
+names(p_i) <- haplotype_names
+
+No_error_contributors_list <- generate_contributors(
+  n_samples = n_samples,
+  n_contributors_range = n_contributors_range,
+  behavior = "Ungrouped",
+  haplotype_freqs = haplotype_freqs,
+  size_range = size_range,
+  distance_range = distance_range,
+  n_distribution = "Negative Binomial"
+)
+No_error_eDNA_results <- generate_eDNA(
+  contributors_list = No_error_contributors_list,
+  shedding_error = shedding_error,
+  decay_rate = decay_rate,
+  shedding_rate = shedding_rate,
+  bio_reps = 3,          # 3 bottle replicates
+  bottle_volume = 1,   # each replicate samples the whole local pool
+  
+)
+No_error_metabarcoding_data <- simulate_metabarcoding_data(
+  No_error_eDNA_results,
+  mean_read_depth = mean_read_depth,
+  read_depth_sd = read_depth_sd,
+  error_sd = error_sd,
+  rep =1
+)
+str(No_error_eDNA_results)
+str(No_error_metabarcoding_data)
+```
+
+
+## Apply the MLE function to the simulated data and extract results
+
+
+Feel free to look ver the code to understand what is happening. But also, you can just run it amd ;ppl at the figures if your want :)
+```{r}
+###############################################################################
+##  (A) p_i  – POPULATION frequencies
+###############################################################################
+p_i <- haplotype_freqs
+names(p_i) <- seq_along(p_i)
+
+###############################################################################
+##  (B) Compute average true N per sample
+###############################################################################
+sample_N <- No_error_eDNA_results$Summary %>%
+  dplyr::group_by(SampleID) %>%
+  dplyr::summarise(True_N = round(mean(Total_contributors)), .groups = "drop")
+
+###############################################################################
+##  (C) Results data frame
+###############################################################################
+metabarcoding_results_df <- data.frame(
+  SampleID            = sample_N$SampleID,
+  True_N              = sample_N$True_N,
+  Estimated_N_MLE_1   = NA, CI_lower_MLE_1 = NA, CI_upper_MLE_1 = NA,
+  Estimated_N_MLE_3   = NA, CI_lower_MLE_3 = NA, CI_upper_MLE_3 = NA,
+  stringsAsFactors    = FALSE
+)
+
+###############################################################################
+##  (D) Loop over samples
+###############################################################################
+for (i in seq_len(nrow(metabarcoding_results_df))) {
+  sample_id <- metabarcoding_results_df$SampleID[i]
+  
+  samp_meta <- No_error_metabarcoding_data[
+    No_error_metabarcoding_data$SampleID == sample_id, ]
+
+  ## ---------- 1-rep MLE (BioRep == 1, SeqRep == 1) -----------------------
+  rep1 <- samp_meta[samp_meta$BioRep == 1 & samp_meta$SeqRep == 1, ]
+  f_vec1 <- numeric(length(p_i)); names(f_vec1) <- names(p_i)
+  for (r in seq_len(nrow(rep1))) {
+    f_vec1[rep1$Haplotype[r]] <- f_vec1[rep1$Haplotype[r]] + rep1$Counts[r]
+  }
+  tot1 <- sum(f_vec1)
+  
+  if (tot1 > 0) {
+    mle1 <- estimate_N_MLE(
+      pi       = p_i,
+      f_mat    = f_vec1 / tot1,
+      lower_N  = 1, upper_N = 1e4,
+      conf_level = 0.95,
+      plot = FALSE, ploidy = "haploid"
+    )
+    metabarcoding_results_df$Estimated_N_MLE_1[i] <- mle1$N_MLE
+    metabarcoding_results_df$CI_lower_MLE_1[i]    <- mle1$conf_interval[1]
+    metabarcoding_results_df$CI_upper_MLE_1[i]    <- mle1$conf_interval[2]
+  }
+
+  ## ---------- 3-rep MLE (BioRep 1–3, averaged) ----------------------------
+  rep_bio <- samp_meta[samp_meta$BioRep %in% 1:3 & samp_meta$SeqRep == 1, ]
+  
+  if (nrow(rep_bio) > 0) {
+    freq_mat <- matrix(0, nrow = 3, ncol = length(p_i))
+    colnames(freq_mat) <- names(p_i)
+    
+    for (b in 1:3) {
+      sub <- rep_bio[rep_bio$BioRep == b, ]
+      if (nrow(sub) > 0) {
+        counts_b <- setNames(rep(0, length(p_i)), names(p_i))
+        counts_b[names(tapply(sub$Counts, sub$Haplotype, sum))] <- tapply(sub$Counts, sub$Haplotype, sum)
+        tot_b <- sum(counts_b)
+        if (!is.na(tot_b) && tot_b > 0) {
+          freq_mat[b, ] <- counts_b / tot_b
+        }
+      }
+    }
+
+    avg_freq3 <- colMeans(freq_mat, na.rm = TRUE)
+    
+    mle3 <- estimate_N_MLE(
+      pi         = p_i,
+      f_mat      = avg_freq3,
+      lower_N    = 1, upper_N = 1e4,
+      conf_level = 0.95,
+      plot       = FALSE,
+      ploidy     = "haploid"
+    )
+    
+    metabarcoding_results_df$Estimated_N_MLE_3[i] <- mle3$N_MLE
+    metabarcoding_results_df$CI_lower_MLE_3[i]    <- mle3$conf_interval[1]
+    metabarcoding_results_df$CI_upper_MLE_3[i]    <- mle3$conf_interval[2]
+  }
+}
+
+###############################################################################
+##  (E) Filter to samples with both MLE estimates
+###############################################################################
+metabarcoding_results_df_clean <- metabarcoding_results_df %>%
+  dplyr::filter(!is.na(Estimated_N_MLE_1),
+                !is.na(Estimated_N_MLE_3))
+
+```
+##Plot
+
+1 replicate estimate
+```{r}
+# Plot True N vs. Estimated N (MoMValue)
+plt_1 <- ggplot(metabarcoding_results_df_clean,
+                aes(True_N, Estimated_N_MLE_1)) +
+  geom_point(alpha = .5, colour = "forestgreen") +
+  geom_pointrange(aes(ymin = CI_lower_MLE_1,
+                      ymax = CI_upper_MLE_1),
+                  alpha = .3, colour = "forestgreen") +
+  geom_smooth(method = "lm", se = FALSE, colour = "darkgreen") +
+  stat_poly_eq(aes(label = paste(..rr.label..)),
+               formula = y ~ x, parse = TRUE) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  scale_x_log10() + scale_y_log10() + theme_classic() +
+  labs(title = "MLE (single BioRep)",
+       x = "True N", y = "Estimated N")
+plt_1
+```
+82% predictive power here under ideal conditions with no noise, given the haplotype frequencies we chose.
+
+
+##Ok, now we can apply it to the noisy data we have generated usptream
+
+```{r}
+################################################################################
+##  APPLYING THE MLE TO THE “UNGROUPED” (NOISY) METABARCODING DATA
+################################################################################
+
+#--- (A) population frequencies -------------------------------------------------
+p_i <- haplotype_freqs
+names(p_i) <- seq_along(p_i)
+
+#--- (B) ground-truth N for every sample (average over BioReps) -----------------
+true_N_noisy <- ungrouped_eDNA_results$Summary %>%
+  group_by(SampleID) %>%
+  summarise(True_N = round(mean(Total_contributors)), .groups = "drop")
+
+#--- (C) result skeleton --------------------------------------------------------
+mle_results_noisy <- data.frame(
+  SampleID            = true_N_noisy$SampleID,
+  True_N              = true_N_noisy$True_N,
+  Estimated_N_MLE_1   = NA, CI_lower_MLE_1 = NA, CI_upper_MLE_1 = NA,
+  Estimated_N_MLE_3   = NA, CI_lower_MLE_3 = NA, CI_upper_MLE_3 = NA
+)
+
+#--- (D) crunch through every sample -------------------------------------------
+for (i in seq_len(nrow(mle_results_noisy))) {
+  
+  sid       <- mle_results_noisy$SampleID[i]
+  samp_meta <- ungrouped_metabarcoding_data %>% filter(SampleID == sid)
+  
+  ## ----- single BioRep (BioRep == 1, SeqRep == 1) ----------------------------
+  rep1 <- samp_meta %>% filter(BioRep == 1, SeqRep == 1)
+  if (nrow(rep1) > 0) {
+    counts_vec <- setNames(rep(0, length(p_i)), names(p_i))
+    counts_vec[as.character(rep1$Haplotype)] <- rep1$Counts
+    
+    mle1 <- estimate_N_MLE(
+      pi         = p_i,
+      f_mat      = counts_vec,
+      lower_N    = 1,
+      upper_N    = 1e4,
+      conf_level = 0.95,
+      plot       = FALSE,
+      ploidy     = "haploid"
+    )
+    
+    mle_results_noisy$Estimated_N_MLE_1[i] <- mle1$N_MLE
+    mle_results_noisy$CI_lower_MLE_1[i]    <- mle1$conf_interval[1]
+    mle_results_noisy$CI_upper_MLE_1[i]    <- mle1$conf_interval[2]
+  }
+  
+  ## ----- pooled BioReps 1–3 (SeqRep == 1) ------------------------------------
+  rep_pool <- samp_meta %>% filter(BioRep %in% 1:3, SeqRep == 1)
+  if (nrow(rep_pool) > 0) {
+    counts_mat <- matrix(0, nrow = 3, ncol = length(p_i),
+                         dimnames = list(NULL, names(p_i)))
+    for (b in 1:3) {
+      sub <- rep_pool %>% filter(BioRep == b)
+      counts_b <- setNames(rep(0, length(p_i)), names(p_i))
+      counts_b[as.character(sub$Haplotype)] <- sub$Counts
+      counts_mat[b, ] <- counts_b
+    }
+    
+    mle3 <- estimate_N_MLE(
+      pi         = p_i,
+      f_mat      = counts_mat,
+      lower_N    = 1,
+      upper_N    = 1e4,
+      conf_level = 0.95,
+      plot       = FALSE,
+      ploidy     = "haploid"
+    )
+    
+    mle_results_noisy$Estimated_N_MLE_3[i] <- mle3$N_MLE
+    mle_results_noisy$CI_lower_MLE_3[i]    <- mle3$conf_interval[1]
+    mle_results_noisy$CI_upper_MLE_3[i]    <- mle3$conf_interval[2]
+  }
+}
+
+#--- filter to completed -------------------------------------------------------
+mle_results_noisy_clean <- mle_results_noisy %>%
+  filter(!is.na(Estimated_N_MLE_1), !is.na(Estimated_N_MLE_3))
+
+################################################################################
+##  (E) quick-and-dirty visual check
+################################################################################
+library(gridExtra)
+
+plt_noisy_1 <- ggplot(mle_results_noisy_clean,
+                      aes(True_N, Estimated_N_MLE_1)) +
+  geom_point(alpha = .5, colour = "firebrick") +
+  geom_pointrange(aes(ymin = CI_lower_MLE_1, ymax = CI_upper_MLE_1),
+                  alpha = .3, colour = "firebrick") +
+  geom_smooth(method = "lm", se = FALSE, colour = "darkred") +
+  stat_poly_eq(aes(label = paste(..rr.label..)),
+               formula = y ~ x, parse = TRUE, colour = "darkred") +
+  geom_abline(slope = 1, linetype = "dashed") +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = "MLE – noisy data (single BioRep)",
+       x = "True N", y = "Estimated N") +
+  theme_classic()
+
+plt_noisy_3 <- ggplot(mle_results_noisy_clean,
+                      aes(True_N, Estimated_N_MLE_3)) +
+  geom_point(alpha = .5, colour = "steelblue") +
+  geom_pointrange(aes(ymin = CI_lower_MLE_3, ymax = CI_upper_MLE_3),
+                  alpha = .3, colour = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, colour = "navy") +
+  stat_poly_eq(aes(label = paste(..rr.label..)),
+               formula = y ~ x, parse = TRUE, colour = "navy") +
+  geom_abline(slope = 1, linetype = "dashed") +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = "MLE – noisy data (pooled 3 BioReps)",
+       x = "True N", y = "Estimated N") +
+  theme_classic()
+
+grid.arrange(plt_noisy_1, plt_noisy_3, ncol = 2)
+
+```
+
+
+It works! Now, go ahead and apply it with your own data!
+
