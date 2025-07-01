@@ -1,0 +1,165 @@
+---
+title: "PI_LOO"
+author: "Pedro Brandao"
+format: html
+editor: visual
+---
+
+```{r}
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyr))
+suppressMessages(library(purrr))
+suppressMessages(library(ggplot2))
+```
+
+## Deriving Population Haplotype Frequencies with LOO
+
+Under the multinomial model each observed relative frequency f_ij is an unbiased draw with: E \[f_ij\] = p_i
+
+A natural estimator of the true population frequency is the unweighted average across M samples: (p_i)\^ = 1/M ∑{j=1}\^M f{ij}
+
+However, using the same sample to estimate p_i and then infer its own contributor number introduces circularity. To avoid this, we compute a leave-one-out estimate: (p_i^(−j))^ = 1/(M−1) ∑{k=1, k≠j}\^M f{ik}
+
+This ensures that for each sample j, the reference frequencies exclude its own data.
+
+##LOO Estimation function Below is the function estimate_pi_loo(), which implements the leave-one-out calculation.
+
+```{r}
+estimate_pi_loo <- function(meta_data,
+                            n_samples_to_use = NULL,
+                            sample_ids       = NULL,
+                            seed             = NULL) {
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  # 1. Establish consistent haplotype levels -------------------------------
+  all_haplos <- sort(unique(meta_data$Haplotype))
+  
+  # 2. Determine sample IDs to include in output ---------------------------
+  all_ids <- sort(unique(meta_data$SampleID))
+  output_ids <-
+    if (!is.null(sample_ids))         intersect(all_ids, sample_ids) else
+      if (!is.null(n_samples_to_use))   sample(all_ids,
+                                               min(n_samples_to_use,length(all_ids)))
+  else all_ids
+  
+  # 3. Ensure Haplotype is a factor with consistent levels -----------------
+  meta_data <- meta_data |> 
+    dplyr::mutate(Haplotype = factor(Haplotype, levels = all_haplos))
+  
+  # 4. Expand sample × haplotype grid -------------------------------------
+  full_df <- tidyr::complete(
+    meta_data,
+    SampleID,
+    Haplotype,
+    fill = list(Counts = 0)
+  )
+  
+  # 5. Compute relative frequencies ----------------------------------------
+  rel <- full_df |>
+    dplyr::group_by(SampleID) |>
+    dplyr::mutate(f_ij = Counts / sum(Counts)) |>
+    dplyr::ungroup()
+  
+  # 6. Loop through all samples, leave one out at a time -------------------
+  loo <- lapply(all_ids, function(j) {
+    rel |>
+      dplyr::filter(SampleID != j) |>
+      dplyr::group_by(Haplotype) |>
+      dplyr::summarise(pi_loo = mean(f_ij), .groups = "drop") |>
+      dplyr::mutate(SampleID = j)
+  }) |>
+    dplyr::bind_rows() |>
+    dplyr::select(SampleID, Haplotype, pi_loo)
+  
+  # 7. Return only requested sample(s), if specified -----------------------
+  if (!is.null(sample_ids)) {
+    loo <- loo |> dplyr::filter(SampleID %in% sample_ids)
+  }
+
+  return(loo)
+}
+
+```
+
+## Example application We apply the LOO estimator to a small meta_data example. 
+
+We create a dataset with 30 samples containign varying frequency of 8 haplotypes:
+
+```{r}
+# Define haplotypes and population frequencies
+haplotypes <- paste0("H", 1:8)
+p_i_raw    <- c(0.30, 0.20, 0.15, 0.10, 0.10, 0.05, 0.05, 0.05) 
+
+# Normalize to ensure they sum to 1
+p_i <- p_i_raw / sum(p_i_raw)
+
+
+# Create sample names
+samples <- paste0("S", 1:30)
+
+# Simulate observed counts for each sample from the known population frequencies
+meta_data <- map_dfr(samples, function(s) {
+  total_ct <- sample(1:100, 1)
+  counts   <- as.vector(rmultinom(1, size = total_ct, prob = p_i))
+  
+  tibble(
+    SampleID  = s,
+    Haplotype = haplotypes,
+    Counts    = counts
+  )
+})
+
+# Preview simulated dataset
+print(meta_data)
+
+```
+
+## Demonstration for a Single Sample 
+
+Compute the LOO population frequencies for sample “S5” only:
+
+```{r}
+# Get LOO-estimated frequencies excluding S5
+pi_loo_s5 <- estimate_pi_loo(meta_data, sample_ids = "S5")
+pi_loo_s5
+```
+This returns one pi_loo estimate per haplotype, computed by averaging across all samples except S5. 
+Let's compare with the true frequencies side by side:
+```{r}
+# Join for comparison
+# Convert true population frequencies into tibble
+true_pi <- tibble(Haplotype = haplotypes, true_freq = p_i)
+compare <- left_join(true_pi, pi_loo_s5, by = "Haplotype")
+
+# Print clean summary
+compare %>%
+  dplyr::select(Haplotype, true_freq, pi_loo) %>%
+  print(n = Inf, width = Inf)
+```
+Note they are close but not identical
+
+## Applying for multiple samples now
+
+Let's apply it for every sample and visualize how they compare throughout
+
+```{r}
+# Step 1: Get all LOO estimates
+all_loo <- estimate_pi_loo(meta_data)
+
+# Step 2: Join with true frequencies
+true_pi <- tibble(Haplotype = haplotypes, true_freq = p_i)
+plot_data <- left_join(all_loo, true_pi, by = "Haplotype")
+
+# Step 3: Plot
+ggplot(plot_data, aes(x = Haplotype, y = pi_loo)) +
+  geom_violin(fill = "lightblue", color = "black", width = 0.7) +
+  geom_point(aes(y = true_freq), color = "red", size = 2) +
+  labs(
+    y = "LOO-estimated Frequency",
+    x = "Haplotype",
+    title = "LOO-Estimated Frequencies Across Samples vs. True Frequency"
+  ) +
+  theme_minimal()
+```
+The distribution of frequencies (blue plots) are close to the true frequencies, most of the time. But we are still slightly off! Many samples are needed to estimate frequencies accurately. 
