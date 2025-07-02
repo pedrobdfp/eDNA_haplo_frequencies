@@ -2,7 +2,7 @@
 
 Welcome! This repository contains code and simulations associated with the manuscript:
 
-**"Estimating Organism Abundance Using Within-Sample Haplotype Frequencies of eDNA Metabarcoding Data"**  
+**"Estimating Organism Abundance Using Within-Sample Haplotype Frequencies of eDNA Data"**  
 *Pedro F. P. Brandão-Dias, Gledis Guri, Megan Shaffer, Elizabeth A. Allan, and Ryan P. Kelly*  
 
 This work presents a statistical framework for estimating the number of individual contributors (N) 
